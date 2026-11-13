@@ -1,0 +1,114 @@
+// Copyright 2019-2026 The Liqo Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package wireguard
+
+import (
+	"fmt"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"golang.zx2c4.com/wireguard/wgctrl"
+
+	"github.com/liqotech/liqo/pkg/gateway/tunnel"
+)
+
+const (
+	implLabel        = "implementation"
+	driverLabelValue = "wireguard"
+)
+
+var (
+	// MetricsWgUserImpl is the metric that reports if wireguard is running in userspace mode.
+	MetricsWgUserImpl = prometheus.NewDesc(
+		"liqo_wireguard_implementation",
+		"Wireguard used implementation",
+		[]string{tunnel.MetricsLabels[0], implLabel},
+		nil,
+	)
+)
+
+var _ prometheus.Collector = &PrometheusCollector{}
+
+// PrometheusCollector is a prometheus.Collector that collects Wireguard metrics.
+type PrometheusCollector struct {
+	clientwg       *wgctrl.Client
+	metricsOptions *MetricsOptions
+}
+
+// MetricsOptions contains the options for the PrometheusCollector.
+type MetricsOptions struct {
+	RemoteClusterID  string
+	Namespace        string
+	WgImplementation WgImplementation
+}
+
+// NewPrometheusCollector creates a new PrometheusCollector.
+func NewPrometheusCollector(metricsOpts *MetricsOptions) (*PrometheusCollector, error) {
+	clwg, err := wgctrl.New()
+	if err != nil {
+		return nil, fmt.Errorf("cannot create Wireguard client: %w", err)
+	}
+	return &PrometheusCollector{
+		clientwg:       clwg,
+		metricsOptions: metricsOpts,
+	}, nil
+}
+
+// Describe implements prometheus.Collector.
+func (pc *PrometheusCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- tunnel.MetricsPeerReceivedBytes
+	ch <- tunnel.MetricsPeerTransmittedBytes
+	ch <- MetricsWgUserImpl
+}
+
+// Collect implements prometheus.Collector.
+func (pc *PrometheusCollector) Collect(ch chan<- prometheus.Metric) {
+	device, err := pc.clientwg.Device(tunnel.TunnelInterfaceName)
+	if err != nil {
+		ch <- prometheus.NewInvalidMetric(MetricsWgUserImpl, fmt.Errorf("error collecting wireguard metrics: %w", err))
+		return
+	}
+
+	ch <- prometheus.MustNewConstMetric(
+		MetricsWgUserImpl,
+		prometheus.GaugeValue,
+		1,
+		[]string{driverLabelValue, string(pc.metricsOptions.WgImplementation)}...,
+	)
+
+	if len(device.Peers) != 1 {
+		err := fmt.Errorf("error collecting wireguard metrics: gateway must have exactly 1 peer, it has %d", len(device.Peers))
+		ch <- prometheus.NewInvalidMetric(tunnel.MetricsPeerReceivedBytes, err)
+		ch <- prometheus.NewInvalidMetric(tunnel.MetricsPeerTransmittedBytes, err)
+		return
+	}
+
+	peer := device.Peers[0]
+
+	labels := []string{driverLabelValue, pc.metricsOptions.RemoteClusterID}
+
+	ch <- prometheus.MustNewConstMetric(
+		tunnel.MetricsPeerReceivedBytes,
+		prometheus.CounterValue,
+		float64(peer.ReceiveBytes),
+		labels...,
+	)
+
+	ch <- prometheus.MustNewConstMetric(
+		tunnel.MetricsPeerTransmittedBytes,
+		prometheus.CounterValue,
+		float64(peer.TransmitBytes),
+		labels...,
+	)
+}

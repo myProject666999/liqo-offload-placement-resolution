@@ -1,0 +1,304 @@
+// Copyright 2019-2026 The Liqo Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package route
+
+import (
+	"errors"
+	"fmt"
+	"net"
+	"slices"
+	"strings"
+	"syscall"
+
+	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
+	"k8s.io/utils/ptr"
+
+	networkingv1beta1 "github.com/liqotech/liqo/apis/networking/v1beta1"
+)
+
+// ErrNetworkUnreachable is returned when a route cannot because the network gateway is not reachable.
+var ErrNetworkUnreachable = errors.New("network unreachable")
+
+// EnsureRoutesPresence ensures the presence of the given routes.
+func EnsureRoutesPresence(routes []networkingv1beta1.Route, tableID uint32, existing []netlink.Route) error {
+	for i := range routes {
+		route, err := forgeNetlinkRoute(&routes[i], tableID)
+		if err != nil {
+			return err
+		}
+		existingroute, exists, err := FindRouteInList(&routes[i], existing)
+		if err != nil {
+			return err
+		}
+		if exists {
+			if !IsEqualRoute(route, existingroute) {
+				if err := netlink.RouteReplace(route); err != nil {
+					if isNetworkUnreachableError(err) {
+						return fmt.Errorf("%w: error replacing route %v: %w", ErrNetworkUnreachable, route, err)
+					}
+					return fmt.Errorf("error replacing route %v: %w", route, err)
+				}
+			}
+		} else {
+			if err := netlink.RouteAdd(route); err != nil {
+				if isNetworkUnreachableError(err) {
+					return fmt.Errorf("%w: error adding route %v: %w", ErrNetworkUnreachable, route, err)
+				}
+				return fmt.Errorf("error adding route %v: %w", route, err)
+			}
+		}
+	}
+	return nil
+}
+
+// EnsureRoutesAbsence ensures the absence of the given routes.
+func EnsureRoutesAbsence(routes []networkingv1beta1.Route, existing []netlink.Route) error {
+	for i := range routes {
+		if routes[i].Dst == nil {
+			continue
+		}
+		existingRoute, exists, err := FindRouteInList(&routes[i], existing)
+		if err != nil {
+			return fmt.Errorf("checking route existence: %w", err)
+		}
+		if exists {
+			if err := netlink.RouteDel(existingRoute); err != nil {
+				return fmt.Errorf("deleting route: %w", err)
+			}
+		}
+	}
+	return nil
+}
+
+// FindRouteInList searches for a route matching the given spec within the provided list of existing routes.
+// It returns the matching netlink.Route and true if found, or an error if more than one route matches.
+func FindRouteInList(route *networkingv1beta1.Route, existing []netlink.Route) (*netlink.Route, bool, error) {
+	if route.Dst == nil {
+		return nil, false, nil
+	}
+	_, dst, err := net.ParseCIDR(route.Dst.String())
+	if err != nil {
+		return nil, false, err
+	}
+	var found *netlink.Route
+	for i := range existing {
+		if existing[i].Dst == nil {
+			continue
+		}
+		if existing[i].Dst.String() != dst.String() {
+			continue
+		}
+		if found != nil {
+			return nil, false, fmt.Errorf("multiple routes found with same destination %s", dst.String())
+		}
+		found = &existing[i]
+	}
+	if found == nil {
+		return nil, false, nil
+	}
+	return found, true, nil
+}
+
+// GetRoutesByTableID returns all the routes associated with the given table ID.
+func GetRoutesByTableID(tableID uint32) ([]netlink.Route, error) {
+	return netlink.RouteListFiltered(netlink.FAMILY_ALL, &netlink.Route{
+		Table: int(tableID),
+	}, netlink.RT_FILTER_TABLE)
+}
+
+// IsEqualRoute checks if the two routes are equal.
+func IsEqualRoute(route1, route2 *netlink.Route) bool {
+	if route1.Dst != nil && route2.Dst != nil && route1.Dst.String() != route2.Dst.String() {
+		return false
+	}
+	if route1.Src != nil && route2.Src != nil && route1.Src.String() != route2.Src.String() {
+		return false
+	}
+	if route1.Gw != nil && route2.Gw != nil && route1.Gw.String() != route2.Gw.String() {
+		return false
+	}
+	if route1.LinkIndex != 0 && route2.LinkIndex != 0 && route1.LinkIndex != route2.LinkIndex {
+		return false
+	}
+	if route1.Flags != route2.Flags {
+		return false
+	}
+	multipathLen1 := len(route1.MultiPath)
+	multipathLen2 := len(route2.MultiPath)
+	if multipathLen1 > 0 || multipathLen2 > 0 {
+		if multipathLen1 != multipathLen2 {
+			return false
+		}
+		sorted1 := sortNextHops(route1.MultiPath)
+		sorted2 := sortNextHops(route2.MultiPath)
+
+		for i := range sorted1 {
+			if !sorted1[i].Equal(*sorted2[i]) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// sortNextHops returns a sorted copy of the given multipath next-hops,
+// ordered by Gw, then LinkIndex, then Hops, so that two semantically
+// equal multipath sets can be compared positionally regardless of the
+// original ordering (and are robust to duplicate entries).
+func sortNextHops(nextHops []*netlink.NexthopInfo) []*netlink.NexthopInfo {
+	sorted := slices.Clone(nextHops)
+	slices.SortFunc(sorted, func(a, b *netlink.NexthopInfo) int {
+		if c := strings.Compare(a.Gw.String(), b.Gw.String()); c != 0 {
+			return c
+		}
+		if a.LinkIndex != b.LinkIndex {
+			return a.LinkIndex - b.LinkIndex
+		}
+		return a.Hops - b.Hops
+	})
+	return sorted
+}
+
+// CleanRoutes cleans the routes that are not contained in the given route list.
+func CleanRoutes(routes []networkingv1beta1.Route, existing []netlink.Route) error {
+	for i := range existing {
+		if !IsContainedRoute(&existing[i], routes) {
+			if err := netlink.RouteDel(&existing[i]); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// IsContainedRoute checks if the given route is contained in the route list.
+func IsContainedRoute(route *netlink.Route, routes []networkingv1beta1.Route) bool {
+	for i := range routes {
+		r, err := forgeNetlinkRoute(&routes[i], uint32(route.Table))
+		if err != nil {
+			return false
+		}
+		if IsEqualRoute(route, r) {
+			return true
+		}
+	}
+	return false
+}
+
+// isNetworkUnreachableError returns true if the network is unreachable (gateway not reachable).
+func isNetworkUnreachableError(err error) bool {
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		// ENETUNREACH: network is unreachable (gateway not reachable)
+		return errno == unix.ENETUNREACH
+	}
+	return false
+}
+
+func forgeNetlinkRoute(route *networkingv1beta1.Route, tableID uint32) (*netlink.Route, error) {
+	var flags int
+	var err error
+	var dst *net.IPNet
+	var src, gw net.IP
+	var scope netlink.Scope
+	var linkIndex int
+
+	if route.Dst != nil {
+		_, dst, err = net.ParseCIDR(route.Dst.String())
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if route.Src != nil {
+		src = net.ParseIP(route.Src.String())
+	}
+
+	if route.Gw != nil {
+		gw = net.ParseIP(route.Gw.String())
+	}
+
+	if route.Dev != nil {
+		linkIndex, err = getLinkIDByName(*route.Dev)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if route.Onlink != nil && *route.Onlink {
+		flags |= int(netlink.FLAG_ONLINK)
+	}
+
+	if route.Scope != nil {
+		switch *route.Scope {
+		case networkingv1beta1.GlobalScope:
+			scope = netlink.SCOPE_UNIVERSE
+		case networkingv1beta1.LinkScope:
+			scope = netlink.SCOPE_LINK
+		case networkingv1beta1.HostScope:
+			scope = netlink.SCOPE_HOST
+		case networkingv1beta1.SiteScope:
+			scope = netlink.SCOPE_SITE
+		case networkingv1beta1.NowhereScope:
+			scope = netlink.SCOPE_NOWHERE
+		default:
+		}
+	}
+	var multiPath []*netlink.NexthopInfo
+	if len(route.NextHops) > 0 {
+		// MultiPath (ECMP) routes must not have a main gateway or a main link index
+		// All next-hop specific information is contained within the MultiPath slice.
+		gw = nil
+		linkIndex = 0
+		multiPath = make([]*netlink.NexthopInfo, len(route.NextHops))
+		for i, nh := range route.NextHops {
+			nextHopGw := net.ParseIP(nh.Gw.String())
+			weight := ptr.Deref(nh.Weight, 0)
+			linkID, err := getLinkIDByName(nh.Dev)
+			if err != nil {
+				return nil, fmt.Errorf("getting link for nexthop %d: %w", i, err)
+			}
+
+			multiPath[i] = &netlink.NexthopInfo{
+				Gw:        nextHopGw,
+				LinkIndex: linkID,
+				Hops:      weight,
+			}
+		}
+	}
+
+	return &netlink.Route{
+		Dst:       dst,
+		Gw:        gw,
+		MultiPath: multiPath,
+		Src:       src,
+		LinkIndex: linkIndex,
+		Table:     int(tableID),
+		Flags:     flags,
+		Scope:     scope,
+	}, nil
+}
+
+func getLinkIDByName(name string) (int, error) {
+	link, err := netlink.LinkByName(name)
+	if err != nil {
+		if errors.As(err, &netlink.LinkNotFoundError{}) {
+			return 0, fmt.Errorf("link %s not found: %w", name, err)
+		}
+		return 0, fmt.Errorf("getting link with name %q: %w", name, err)
+	}
+	return link.Attrs().Index, nil
+}

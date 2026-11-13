@@ -1,0 +1,307 @@
+// Copyright 2019-2026 The Liqo Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package forge
+
+import (
+	"fmt"
+	"slices"
+	"strconv"
+	"strings"
+
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
+
+	liqov1beta1 "github.com/liqotech/liqo/apis/core/v1beta1"
+	offloadingv1beta1 "github.com/liqotech/liqo/apis/offloading/v1beta1"
+	argsutils "github.com/liqotech/liqo/pkg/utils/args"
+	"github.com/liqotech/liqo/pkg/virtualKubelet/reflection/resources"
+	vk "github.com/liqotech/liqo/pkg/vkMachinery"
+)
+
+// StringifyArgument returns a string representation of the key-value pair.
+func StringifyArgument(key, value string) string {
+	return fmt.Sprintf("%s=%s", key, value)
+}
+
+// DestringifyArgument returns the key and the value of the string representation of the key-value pair.
+func DestringifyArgument(arg string) (key, value string) {
+	split := strings.SplitN(arg, "=", 2)
+	return split[0], split[1]
+}
+
+func getDefaultStorageClass(storageClasses []liqov1beta1.StorageType) liqov1beta1.StorageType {
+	for _, storageClass := range storageClasses {
+		if storageClass.Default {
+			return storageClass
+		}
+	}
+	return storageClasses[0]
+}
+
+func getDefaultIngressClass(ingressClasses []liqov1beta1.IngressType) liqov1beta1.IngressType {
+	for _, ingressClass := range ingressClasses {
+		if ingressClass.Default {
+			return ingressClass
+		}
+	}
+	return ingressClasses[0]
+}
+
+func getDefaultLoadBalancerClass(loadBalancerClasses []liqov1beta1.LoadBalancerType) liqov1beta1.LoadBalancerType {
+	for _, loadBalancerClass := range loadBalancerClasses {
+		if loadBalancerClass.Default {
+			return loadBalancerClass
+		}
+	}
+	return loadBalancerClasses[0]
+}
+
+func forgeVKContainers(
+	homeCluster, remoteCluster liqov1beta1.ClusterID,
+	vkNamespace, liqoNamespace string, localPodCIDRs []string,
+	virtualNode *offloadingv1beta1.VirtualNode,
+	opts *offloadingv1beta1.VkOptionsTemplate) []v1.Container {
+	command := []string{
+		"/usr/bin/virtual-kubelet",
+	}
+
+	nodeName := virtualNode.Name
+	storageClasses := virtualNode.Spec.StorageClasses
+	ingressClasses := virtualNode.Spec.IngressClasses
+	loadBalancerClasses := virtualNode.Spec.LoadBalancerClasses
+
+	args := []string{
+		StringifyArgument(string(ForeignClusterID), string(remoteCluster)),
+		StringifyArgument(string(NodeName), nodeName),
+		StringifyArgument(string(NodeIP), "$(POD_IP)"),
+		StringifyArgument(string(TenantNamespace), vkNamespace),
+		StringifyArgument(string(LiqoNamespace), liqoNamespace),
+		StringifyArgument(string(HomeClusterID), string(homeCluster)),
+	}
+	for i := range localPodCIDRs {
+		args = append(args, StringifyArgument(string(LocalPodCIDR), localPodCIDRs[i]))
+	}
+
+	if virtualNode.Spec.KubeconfigSecretRef != nil && virtualNode.Spec.KubeconfigSecretRef.Name != "" {
+		args = append(args, StringifyArgument(string(ForeignClusterKubeconfigSecretName), virtualNode.Spec.KubeconfigSecretRef.Name))
+	}
+	args = append(args,
+		StringifyArgument(string(CreateNode), strconv.FormatBool(EffectiveCreateNode(virtualNode, opts))),
+		StringifyArgument(string(NodeCheckNetwork), strconv.FormatBool(!EffectiveDisableNetworkCheck(virtualNode, opts))),
+	)
+
+	if len(storageClasses) > 0 {
+		args = append(args, string(EnableStorage),
+			StringifyArgument(string(RemoteRealStorageClassName),
+				getDefaultStorageClass(storageClasses).StorageClassName))
+	}
+	if len(ingressClasses) > 0 {
+		args = append(args, string(EnableIngress),
+			StringifyArgument(string(RemoteRealIngressClassName),
+				getDefaultIngressClass(ingressClasses).IngressClassName))
+	}
+	if len(loadBalancerClasses) > 0 {
+		args = append(args, string(EnableLoadBalancer),
+			StringifyArgument(string(RemoteRealLoadBalancerClassName),
+				getDefaultLoadBalancerClass(loadBalancerClasses).LoadBalancerClassName))
+	}
+
+	args = appendArgsReflectorsWorkers(args, opts.Spec.ReflectorsConfig)
+	args = appendArgsReflectorsType(args, opts.Spec.ReflectorsConfig)
+	args = appendArgsCustomResources(args, opts.Spec.CustomResources)
+
+	if extraAnnotations := opts.Spec.NodeExtraAnnotations; len(extraAnnotations) != 0 {
+		stringifiedMap := argsutils.StringMap{StringMap: extraAnnotations}.String()
+		args = append(args, StringifyArgument(string(NodeExtraAnnotations), stringifiedMap))
+	}
+	if extraLabels := opts.Spec.NodeExtraLabels; len(extraLabels) != 0 {
+		stringifiedMap := argsutils.StringMap{StringMap: extraLabels}.String()
+		args = append(args, StringifyArgument(string(NodeExtraLabels), stringifiedMap))
+	}
+
+	args = append(args, opts.Spec.ExtraArgs...)
+
+	containerPorts := []v1.ContainerPort{}
+	args = append(args, StringifyArgument(string(MetricsEnabled), strconv.FormatBool(opts.Spec.MetricsEnabled)))
+	if opts.Spec.MetricsEnabled {
+		args = append(args, StringifyArgument(string(MetricsAddress), opts.Spec.MetricsAddress))
+		metrAddrSplit := strings.Split(opts.Spec.MetricsAddress, ":")
+		metricsPort, err := strconv.ParseInt(metrAddrSplit[len(metrAddrSplit)-1], 10, 32)
+		if err != nil {
+			metrAddrSplit := strings.Split(vk.MetricsAddress, ":")
+			// if the metrics address is not valid, use the default one
+			metricsPort, _ = strconv.ParseInt(metrAddrSplit[len(metrAddrSplit)-1], 10, 32)
+		}
+		containerPorts = append(containerPorts, v1.ContainerPort{
+			Name:          "metrics",
+			ContainerPort: int32(metricsPort),
+			Protocol:      v1.ProtocolTCP,
+		})
+	}
+
+	pullPolicy := v1.PullIfNotPresent
+	if opts.Spec.PullPolicy != "" {
+		pullPolicy = opts.Spec.PullPolicy
+	}
+
+	return []v1.Container{
+		{
+			Name:            vk.ContainerName,
+			Resources:       opts.Spec.Resources,
+			Image:           opts.Spec.ContainerImage,
+			ImagePullPolicy: pullPolicy,
+			Command:         command,
+			Args:            args,
+			Env: []v1.EnvVar{
+				{
+					Name:      "POD_IP",
+					ValueFrom: &v1.EnvVarSource{FieldRef: &v1.ObjectFieldSelector{FieldPath: "status.podIP"}},
+				},
+				{
+					Name:      "POD_NAME",
+					ValueFrom: &v1.EnvVarSource{FieldRef: &v1.ObjectFieldSelector{FieldPath: "metadata.name"}},
+				},
+				{
+					Name:      "POD_NAMESPACE",
+					ValueFrom: &v1.EnvVarSource{FieldRef: &v1.ObjectFieldSelector{FieldPath: "metadata.namespace"}},
+				},
+				{
+					Name:  "VIRTUALNODE_NAME",
+					Value: nodeName,
+				},
+			},
+			Ports: containerPorts,
+			// The readiness probe only asserts that the virtual-kubelet started correctly
+			// (i.e., the arguments have been parsed), not that it is reconciling.
+			ReadinessProbe: &v1.Probe{
+				ProbeHandler: v1.ProbeHandler{
+					HTTPGet: &v1.HTTPGetAction{
+						Path: "/readyz",
+						Port: intstr.FromInt32(vk.HealthPort),
+					},
+				},
+				InitialDelaySeconds: 2,
+				PeriodSeconds:       5,
+				TimeoutSeconds:      1,
+				FailureThreshold:    3,
+			},
+		},
+	}
+}
+
+// EffectiveCreateNode returns whether the node has to be created, defaulting to the
+// value specified in the VkOptionsTemplate when not set in the VirtualNode spec.
+func EffectiveCreateNode(virtualNode *offloadingv1beta1.VirtualNode, opts *offloadingv1beta1.VkOptionsTemplate) bool {
+	return ptr.Deref(virtualNode.Spec.CreateNode, opts.Spec.CreateNode)
+}
+
+// EffectiveDisableNetworkCheck returns whether the network check has to be disabled,
+// defaulting to the value specified in the VkOptionsTemplate when not set in the VirtualNode spec.
+func EffectiveDisableNetworkCheck(virtualNode *offloadingv1beta1.VirtualNode, opts *offloadingv1beta1.VkOptionsTemplate) bool {
+	return ptr.Deref(virtualNode.Spec.DisableNetworkCheck, opts.Spec.DisableNetworkCheck)
+}
+
+// EffectiveOffloadingPatch returns the offloading patch actually enforced by the
+// virtual-kubelet: the spec's OffloadingPatch with the labels and annotations not to
+// be reflected merged with the ones specified in the VkOptionsTemplate.
+func EffectiveOffloadingPatch(virtualNode *offloadingv1beta1.VirtualNode,
+	opts *offloadingv1beta1.VkOptionsTemplate) *offloadingv1beta1.OffloadingPatch {
+	if virtualNode.Spec.OffloadingPatch == nil {
+		if len(opts.Spec.LabelsNotReflected) == 0 && len(opts.Spec.AnnotationsNotReflected) == 0 {
+			return nil
+		}
+		return &offloadingv1beta1.OffloadingPatch{
+			LabelsNotReflected:      opts.Spec.LabelsNotReflected,
+			AnnotationsNotReflected: opts.Spec.AnnotationsNotReflected,
+		}
+	}
+
+	effective := virtualNode.Spec.OffloadingPatch.DeepCopy()
+	effective.LabelsNotReflected = mergeUnique(effective.LabelsNotReflected, opts.Spec.LabelsNotReflected)
+	effective.AnnotationsNotReflected = mergeUnique(effective.AnnotationsNotReflected, opts.Spec.AnnotationsNotReflected)
+	return effective
+}
+
+// mergeUnique returns the ordered union of the two slices, without duplicates.
+func mergeUnique(primary, secondary []string) []string {
+	merged := make([]string, 0, len(primary)+len(secondary))
+	for _, s := range slices.Concat(primary, secondary) {
+		if !slices.Contains(merged, s) {
+			merged = append(merged, s)
+		}
+	}
+	return merged
+}
+
+func forgeVKPodSpec(vkNamespace string, homeCluster liqov1beta1.ClusterID, liqoNamespace string, localPodCIDRs []string,
+	virtualNode *offloadingv1beta1.VirtualNode, opts *offloadingv1beta1.VkOptionsTemplate) v1.PodSpec {
+	return v1.PodSpec{
+		Containers: forgeVKContainers(
+			homeCluster, virtualNode.Spec.ClusterID,
+			vkNamespace, liqoNamespace, localPodCIDRs,
+			virtualNode, opts),
+		ServiceAccountName: VirtualKubeletServiceAccountName(virtualNode.Name),
+		ImagePullSecrets:   opts.Spec.ImagePullSecrets,
+		Tolerations:        opts.Spec.Tolerations,
+	}
+}
+
+func appendArgsReflectorsWorkers(args []string, reflectorsConfig map[string]offloadingv1beta1.ReflectorConfig) []string {
+	if reflectorsConfig == nil {
+		return args
+	}
+
+	for _, resource := range resources.Reflectors {
+		reflector, ok := reflectorsConfig[string(resource)]
+		if !ok {
+			continue
+		}
+		key := fmt.Sprintf("--%s-reflection-workers", resource)
+		args = append(args, StringifyArgument(key, strconv.Itoa(int(reflector.NumWorkers))))
+	}
+
+	return args
+}
+
+func appendArgsReflectorsType(args []string, reflectorsConfig map[string]offloadingv1beta1.ReflectorConfig) []string {
+	if reflectorsConfig == nil {
+		return args
+	}
+
+	for _, resource := range resources.ReflectorsCustomizableType {
+		reflector, ok := reflectorsConfig[string(resource)]
+		if !ok {
+			continue
+		}
+		key := fmt.Sprintf("--%s-reflection-type", resource)
+		args = append(args, StringifyArgument(key, string(reflector.Type)))
+	}
+
+	return args
+}
+
+func appendArgsCustomResources(args []string, customResources []offloadingv1beta1.CustomResourceReflectorConfig) []string {
+	for i := range customResources {
+		cr := &customResources[i]
+		reflectionType := cr.Type
+		if reflectionType == "" {
+			reflectionType = offloadingv1beta1.AllowList
+		}
+		value := fmt.Sprintf("%s/%s/%s,%d,%s,%t", cr.Group, cr.Version, cr.Resource, cr.NumWorkers, reflectionType, cr.StatusSync)
+		args = append(args, StringifyArgument(string(CustomResourceReflection), value))
+	}
+	return args
+}

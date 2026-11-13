@@ -1,0 +1,285 @@
+// Copyright 2019-2026 The Liqo Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package utils
+
+import (
+	"fmt"
+	"math"
+	"strconv"
+
+	"github.com/google/nftables"
+	"github.com/google/nftables/binaryutil"
+	"github.com/google/nftables/expr"
+	"github.com/google/nftables/userdata"
+
+	firewallv1beta1 "github.com/liqotech/liqo/apis/networking/v1beta1/firewall"
+)
+
+var _ Rule = &FilterRuleWrapper{}
+
+// FilterRuleWrapper is a wrapper for a FilterRule.
+type FilterRuleWrapper struct {
+	*firewallv1beta1.FilterRule
+}
+
+// GetName returns the name of the rule.
+func (fr *FilterRuleWrapper) GetName() *string {
+	return fr.Name
+}
+
+// SetName sets the name of the rule.
+func (fr *FilterRuleWrapper) SetName(name string) {
+	fr.Name = &name
+}
+
+// Add adds the rule to the chain.
+func (fr *FilterRuleWrapper) Add(nftconn *nftables.Conn, chain *nftables.Chain) error {
+	rule, err := forgeFilterRule(fr.FilterRule, chain)
+	if err != nil {
+		return err
+	}
+
+	nftconn.AddRule(rule)
+	return nil
+}
+
+// Equal checks if the rule is equal to the given one.
+func (fr *FilterRuleWrapper) Equal(currentrule *nftables.Rule) bool {
+	currentrule.Chain.Table = currentrule.Table
+	newrule, err := forgeFilterRule(fr.FilterRule, currentrule.Chain)
+	// TODO: this ugly exception is caused by an error in the expr retrieved by nftables library.
+	// In particular, the expr retrieved by the library when the action is ctmark
+	// Retrieved expr: &{0 false 3}
+	// Generated expr: &{1 true 3}
+	// We think that this error should be caused by a library bug.
+	// We are going to investigate it further.
+	if fr.FilterRule.Action == firewallv1beta1.ActionCtMark {
+		return true
+	}
+	if err != nil {
+		return false
+	}
+
+	return compareRuleExpressions(*fr.Name, currentrule, newrule)
+}
+
+// forgeFilterRule forges a nftables rule from a FilterRule.
+func forgeFilterRule(fr *firewallv1beta1.FilterRule, chain *nftables.Chain) (*nftables.Rule, error) {
+	rule := &nftables.Rule{
+		Table:    chain.Table,
+		Chain:    chain,
+		UserData: userdata.AppendString([]byte{}, userdata.TypeComment, *fr.Name),
+	}
+
+	for i := range fr.Match {
+		if err := applyMatch(&fr.Match[i], rule); err != nil {
+			return nil, err
+		}
+	}
+
+	if fr.Counter {
+		applyCounter(rule)
+	}
+
+	switch fr.Action {
+	case firewallv1beta1.ActionCtMark:
+		err := applyCtMarkAction(fr.Value, rule)
+		if err != nil {
+			return nil, fmt.Errorf("cannot apply ctmark action: %w", err)
+		}
+	case firewallv1beta1.ActionSetMetaMarkFromCtMark:
+		applySetMetaMarkFromCtMarkAction(rule)
+	case firewallv1beta1.ActionTCPMssClamp:
+		if err := applyTCPMssClampAction(fr.Value, rule); err != nil {
+			return nil, fmt.Errorf("cannot apply tcpmssclamp action: %w", err)
+		}
+	case firewallv1beta1.ActionAccept:
+		applyAcceptAction(rule)
+	case firewallv1beta1.ActionDrop:
+		applyDropAction(rule)
+	case firewallv1beta1.ActionReject:
+		applyRejectAction(rule)
+	case firewallv1beta1.ActionNotrack:
+		applyNotrackAction(rule)
+	case firewallv1beta1.ActionSetMetaMark:
+		if err := applySetMetaMarkAction(fr.Value, rule); err != nil {
+			return nil, fmt.Errorf("cannot apply setmetamark action: %w", err)
+		}
+	default:
+	}
+
+	return rule, nil
+}
+
+func applyCtMarkAction(value *string, rule *nftables.Rule) error {
+	if value == nil {
+		return fmt.Errorf("value is required for %s action", firewallv1beta1.ActionCtMark)
+	}
+	valueInt, err := strconv.Atoi(*value)
+	if err != nil {
+		return fmt.Errorf("cannot convert value to int: %w", err)
+	}
+	if valueInt < 0 || int64(valueInt) > math.MaxUint32 {
+		return fmt.Errorf("value %d is out of range for a uint32 mark", valueInt)
+	}
+	rule.Exprs = append(rule.Exprs,
+		&expr.Immediate{
+			Register: 1,
+			Data:     binaryutil.NativeEndian.PutUint32(uint32(valueInt)),
+		}, &expr.Ct{
+			Register:       1,
+			SourceRegister: true,
+			Key:            expr.CtKeyMARK,
+		},
+	)
+	return nil
+}
+
+func applySetMetaMarkFromCtMarkAction(rule *nftables.Rule) {
+	rule.Exprs = append(rule.Exprs,
+		&expr.Ct{
+			Register:       1,
+			Key:            expr.CtKeyMARK,
+			SourceRegister: false,
+		},
+		&expr.Meta{
+			Key:            expr.MetaKeyMARK,
+			SourceRegister: true,
+			Register:       1,
+		},
+	)
+}
+
+func applyTCPMssClampAction(value *string, rule *nftables.Rule) error {
+	var (
+		err  error
+		size int
+	)
+
+	if value != nil {
+		size, err = strconv.Atoi(*value)
+		if err != nil {
+			return fmt.Errorf("cannot convert value to int: %w", err)
+		}
+	}
+
+	rule.Exprs = append(rule.Exprs,
+		// Match TCP SYN flag
+		// Load TCP flags byte (offset 13 in TCP header)
+		&expr.Payload{
+			DestRegister: 1,
+			Base:         expr.PayloadBaseTransportHeader,
+			Offset:       13, // TCP flags offset
+			Len:          1,
+		},
+		// Apply bitmask to check SYN flag (0x02)
+		&expr.Bitwise{
+			DestRegister:   1,
+			SourceRegister: 1,
+			Len:            1,
+			Mask:           []byte{0x02}, // SYN flag mask
+			Xor:            []byte{0x00},
+		},
+		// Check if SYN flag is set (not equal to 0)
+		&expr.Cmp{
+			Op:       expr.CmpOpNeq,
+			Register: 1,
+			Data:     []byte{0x00},
+		})
+
+	if size == 0 {
+		rule.Exprs = append(rule.Exprs, // Load route MTU into register 1
+			&expr.Rt{
+				Register: 1,
+				Key:      expr.RtTCPMSS,
+			},
+
+			// Convert to network byte order (host to network)
+			&expr.Byteorder{
+				DestRegister:   1,
+				SourceRegister: 1,
+				Op:             expr.ByteorderHton,
+				Len:            2,
+				Size:           2,
+			})
+	} else {
+		rule.Exprs = append(rule.Exprs,
+			// Load fixed MSS value into register 1
+			&expr.Immediate{
+				Register: 1,
+				Data:     []byte{byte(size >> 8), byte(size)},
+			},
+		)
+	}
+
+	rule.Exprs = append(rule.Exprs,
+		// Write the MSS value to TCP option maxseg
+		// TCP option type 2 = MSS, offset 2, length 2 bytes
+		&expr.Exthdr{
+			SourceRegister: 1,
+			Type:           2, // TCP option MSS
+			Offset:         2, // Offset within the option
+			Len:            2, // 2 bytes for MSS value
+			Op:             expr.ExthdrOpTcpopt,
+		},
+	)
+
+	return nil
+}
+
+func applyAcceptAction(rule *nftables.Rule) {
+	rule.Exprs = append(rule.Exprs, &expr.Verdict{Kind: expr.VerdictAccept})
+}
+
+func applyDropAction(rule *nftables.Rule) {
+	rule.Exprs = append(rule.Exprs, &expr.Verdict{Kind: expr.VerdictDrop})
+}
+
+func applyRejectAction(rule *nftables.Rule) {
+	rule.Exprs = append(rule.Exprs, &expr.Reject{})
+}
+
+func applyNotrackAction(rule *nftables.Rule) {
+	rule.Exprs = append(rule.Exprs, &expr.Notrack{})
+}
+
+func applySetMetaMarkAction(value *string, rule *nftables.Rule) error {
+	if value == nil {
+		return fmt.Errorf("value is required for %s action", firewallv1beta1.ActionSetMetaMark)
+	}
+	valueInt, err := strconv.Atoi(*value)
+	if err != nil {
+		return fmt.Errorf("cannot convert value to int: %w", err)
+	}
+	if valueInt < 0 || int64(valueInt) > math.MaxUint32 {
+		return fmt.Errorf("value %d is out of range for a uint32 mark", valueInt)
+	}
+	rule.Exprs = append(rule.Exprs,
+		&expr.Immediate{
+			Register: 1,
+			Data:     binaryutil.NativeEndian.PutUint32(uint32(valueInt)),
+		},
+		&expr.Meta{
+			Key:            expr.MetaKeyMARK,
+			SourceRegister: true,
+			Register:       1,
+		},
+	)
+	return nil
+}
+
+func applyCounter(rule *nftables.Rule) {
+	rule.Exprs = append(rule.Exprs, &expr.Counter{Bytes: 1, Packets: 1})
+}
