@@ -35,6 +35,12 @@ liqoctl offload namespace foo --output yaml
 Then, the resulting manifest can be applied with *kubectl*, or through automation tools (e.g., by means of GitOps approaches).
 
 ```{admonition} Note
+The `--ns-selector` option supports equality-based queries only (`=`, `==`, `!=`), and it is **evaluated once**, when the command runs: namespaces labeled afterwards are **not** automatically offloaded.
+The command **fails** when the selector matches no namespace, instead of silently succeeding.
+Namespaces matched through the selector that are **already offloaded** are **skipped and listed** in the command output; they are updated only when explicitly authorized through the `--override-existing` flag (namespaces explicitly named on the command line are always updated, since naming them is already an explicit choice).
+```
+
+```{admonition} Note
 Possible race conditions might occur in case a *NamespaceOffloading* resource is created at the same time (e.g., as a batch) as pods (or higher level abstractions such as *Deployments*), preventing them from being considered for offloading until the *NamespaceOffloading* resource is not processed.
 
 This situation can be prevented manually labeling in advance the hosting namespace with the *liqo.io/scheduling-enabled=true* label, hence enabling the Liqo mutating webhook and causing pod creations to be rejected until pod offloading is possible.
@@ -137,6 +143,27 @@ metadata:
 spec:
   runtimeClassName: liqo
   # ...
+```
+
+### Placement constraints resolution
+
+The set of nodes that can host a pod of an offloaded namespace results from the combination of four layers, evaluated by the mutating webhook and the Kubernetes scheduler:
+
+1. the **pod offloading strategy**: *Local* imposes no constraint (virtual nodes stay unreachable through their taint, since no toleration is added); *Remote* appends the `liqo.io/type=virtual-node` requirement to **every** term of the *cluster selector*, excluding the local nodes; *LocalAndRemote*, when a *cluster selector* is specified, adds an extra term **allowing the local nodes** as well;
+2. the **cluster selector**: terms are combined in logical **OR**, while the requirements inside each term are combined in logical **AND** (e.g., the terms `{region=eu}` and `{region=us}` select the clusters of *either* region, while a single term `{region=eu, provider}` requires *both* conditions);
+3. the **pod own conditions**: `spec.nodeSelector` and the required node affinity *stack* with the constraints above (all of them must hold); the pod affinity terms and the imposed selector terms are merged through their **cartesian product** (e.g., 3 pod terms and 4 cluster terms produce 12 merged terms), bounded by a configurable limit (64 by default): when the product exceeds the limit, the resolution is **rejected**, never truncated;
+4. the **node taints** not tolerated by the pod, accounting for the virtual-node toleration injected by the webhook for the *Remote* and *LocalAndRemote* strategies.
+
+Pods using the **Liqo runtime class** bypass the webhook mutation entirely: no toleration is added and no selector is imposed, and the pod is evaluated against its own conditions only.
+
+The `pkg/utils/offloading` package provides the pure `ResolvePlacement` function reproducing this logic offline: given the *NamespaceOffloading*, the pod conditions and the labels/taints of the candidate (local and virtual) nodes, it returns the candidate nodes and, for each excluded node, the **per-layer reasons** (strategy, cluster selector, pod nodeSelector, pod affinity, taints), instead of a generic "no available nodes" outcome.
+It does not perform resource binpacking nor replaces the scheduler.
+
+```{admonition} Compatibility changes
+The introduction of the resolution logic fixed two pre-existing issues of the constraint merge path:
+
+* `utils.MergeNodeSelector` now **preserves the `MatchFields`** (e.g., `metadata.name`) of the merged terms; previously they were silently dropped, and a required node affinity constraining `metadata.name` was lost when merged with the *NamespaceOffloading* selector;
+* the selector imposed by the webhook is now built over a **deep copy** of the *ClusterSelector*; previously, the `liqo.io/type=virtual-node` requirement was appended in place to the (possibly cache-backed) *NamespaceOffloading* object when the *Remote* strategy was used.
 ```
 
 ## Unoffloading a namespace

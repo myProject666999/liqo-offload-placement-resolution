@@ -81,24 +81,42 @@ func IsVirtualNode(node *corev1.Node) bool {
 }
 
 // MergeNodeSelector merges two nodeSelectors.
-// Every MatchExpression of the first one must be merged with all the MatchExpressions of the second one:
-// n first MatchExpressions.
-// m second MatchExpressions.
-// m * n MergedNodeSelector MatchExpressions.
+// Every NodeSelectorTerm of the first one must be merged with all the NodeSelectorTerms of the second one:
+// n first NodeSelectorTerms.
+// m second NodeSelectorTerms.
+// m * n MergedNodeSelector NodeSelectorTerms.
 // For each term in the first selector, AND each term of the second selector:
 // (A || B) && (C || D) -> (A && C) || (A && D) || (B && C) || (B && D).
+// Both MatchExpressions and MatchFields (e.g., metadata.name) of the two terms are preserved in the
+// merged term: dropping the MatchFields would silently discard constraints such as metadata.name.
+// The input selectors are left unmodified.
 func MergeNodeSelector(ns1, ns2 *corev1.NodeSelector) corev1.NodeSelector {
 	mergedNodeSelector := corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{}}
 	for i := range ns1.NodeSelectorTerms {
 		for j := range ns2.NodeSelectorTerms {
-			newMatchExpression := ns1.NodeSelectorTerms[i].DeepCopy().MatchExpressions
-			newMatchExpression = append(newMatchExpression, ns2.NodeSelectorTerms[j].MatchExpressions...)
+			term1 := ns1.NodeSelectorTerms[i].DeepCopy()
+			term2 := ns2.NodeSelectorTerms[j].DeepCopy()
 			mergedNodeSelector.NodeSelectorTerms = append(mergedNodeSelector.NodeSelectorTerms, corev1.NodeSelectorTerm{
-				MatchExpressions: newMatchExpression,
+				MatchExpressions: append(term1.MatchExpressions, term2.MatchExpressions...),
+				MatchFields:      append(term1.MatchFields, term2.MatchFields...),
 			})
 		}
 	}
 	return mergedNodeSelector
+}
+
+// MergeNodeSelectorWithLimit merges two nodeSelectors like MergeNodeSelector, but rejects the merge
+// when the cartesian product of the terms would exceed maxTerms, instead of silently truncating it.
+func MergeNodeSelectorWithLimit(ns1, ns2 *corev1.NodeSelector, maxTerms int) (corev1.NodeSelector, error) {
+	if maxTerms <= 0 {
+		return corev1.NodeSelector{}, fmt.Errorf("invalid maximum number of merged node selector terms: %d", maxTerms)
+	}
+	n1, n2 := len(ns1.NodeSelectorTerms), len(ns2.NodeSelectorTerms)
+	if n1*n2 > maxTerms {
+		return corev1.NodeSelector{}, fmt.Errorf(
+			"merging node selectors would produce %d terms (%d x %d), exceeding the limit of %d", n1*n2, n1, n2, maxTerms)
+	}
+	return MergeNodeSelector(ns1, ns2), nil
 }
 
 // GetNodeClusterID returns the clusterID given a virtual node.

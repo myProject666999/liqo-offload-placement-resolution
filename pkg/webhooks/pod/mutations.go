@@ -21,79 +21,30 @@ import (
 	"k8s.io/klog/v2"
 
 	offloadingv1beta1 "github.com/liqotech/liqo/apis/offloading/v1beta1"
-	liqoconst "github.com/liqotech/liqo/pkg/consts"
 	"github.com/liqotech/liqo/pkg/utils"
+	offloadingutils "github.com/liqotech/liqo/pkg/utils/offloading"
 )
 
 // getVirtualNodeToleration returns a new Toleration for the Liqo's virtual-nodes.
 func getVirtualNodeToleration() corev1.Toleration {
-	return corev1.Toleration{
-		Key:      liqoconst.VirtualNodeTolerationKey,
-		Operator: corev1.TolerationOpExists,
-		Effect:   corev1.TaintEffectNoExecute,
-	}
+	return offloadingutils.VirtualNodeToleration()
 }
 
 // createTolerationFromNamespaceOffloading creates a new virtualNodeToleration in case of LocalAndRemotePodOffloadingStrategyType
 // or RemotePodOffloadingStrategyType. In case of PodOffloadingStrategyType not recognized, returns an error.
 func createTolerationFromNamespaceOffloading(strategy offloadingv1beta1.PodOffloadingStrategyType) (corev1.Toleration, error) {
-	var toleration corev1.Toleration
-	switch strategy {
-	case offloadingv1beta1.LocalAndRemotePodOffloadingStrategyType, offloadingv1beta1.RemotePodOffloadingStrategyType:
-		// The virtual-node toleration must be added.
-		toleration = getVirtualNodeToleration()
-	case offloadingv1beta1.LocalPodOffloadingStrategyType:
-		return toleration, nil
-	default:
-		err := fmt.Errorf("unknown PodOffloadingStrategyType %q", strategy)
-		return toleration, err
+	toleration, err := offloadingutils.ImposedToleration(strategy)
+	if err != nil || toleration == nil {
+		return corev1.Toleration{}, err
 	}
-	return toleration, nil
+	return *toleration, nil
 }
 
 // createNodeSelectorFromNamespaceOffloading creates the right NodeSelector according to the PodOffloadingStrategy chosen.
+// The returned selector is built over a deep copy of the NamespaceOffloading ClusterSelector, which is never modified:
+// the object retrieved by the webhook may be backed by the informer cache.
 func createNodeSelectorFromNamespaceOffloading(nsoff *offloadingv1beta1.NamespaceOffloading) (*corev1.NodeSelector, error) {
-	nodeSelector := nsoff.Spec.ClusterSelector
-	switch nsoff.Spec.PodOffloadingStrategy {
-	case offloadingv1beta1.RemotePodOffloadingStrategyType:
-		// To ensure that the pod is not scheduled on local nodes is necessary to add to every NodeSelectorTerm a
-		// new NodeSelectorRequirement. This NodeSelectorRequirement requires explicitly the label
-		// "liqo.io/type=virtual-node" to exclude local nodes from the scheduler choice.
-		if len(nodeSelector.NodeSelectorTerms) == 0 {
-			nodeSelector.NodeSelectorTerms = []corev1.NodeSelectorTerm{{}}
-		}
-
-		for i := range nodeSelector.NodeSelectorTerms {
-			nodeSelector.NodeSelectorTerms[i].MatchExpressions = append(nodeSelector.NodeSelectorTerms[i].MatchExpressions,
-				corev1.NodeSelectorRequirement{
-					Key:      liqoconst.TypeLabel,
-					Operator: corev1.NodeSelectorOpIn,
-					Values:   []string{liqoconst.TypeNode},
-				})
-		}
-
-	case offloadingv1beta1.LocalAndRemotePodOffloadingStrategyType:
-		// In case the selector is empty, it is not necessary to modify anything, as it already allows pods to be scheduled on all nodes.
-		if len(nodeSelector.NodeSelectorTerms) == 0 {
-			return nil, nil
-		}
-
-		// Otherwise, let add a new NodeSelectorTerm that allows scheduling pods also on local nodes.
-		newNodeSelectorTerm := corev1.NodeSelectorTerm{
-			MatchExpressions: []corev1.NodeSelectorRequirement{{
-				Key:      liqoconst.TypeLabel,
-				Operator: corev1.NodeSelectorOpNotIn,
-				Values:   []string{liqoconst.TypeNode},
-			}},
-		}
-		nodeSelector.NodeSelectorTerms = append(nodeSelector.NodeSelectorTerms, newNodeSelectorTerm)
-	case offloadingv1beta1.LocalPodOffloadingStrategyType:
-		return nil, nil
-	default:
-		err := fmt.Errorf("unknown PodOffloadingStrategyType %q", nsoff.Spec.PodOffloadingStrategy)
-		return nil, err
-	}
-	return &nodeSelector, nil
+	return offloadingutils.ImposedNodeSelector(nsoff)
 }
 
 // fillPodWithTheNewNodeSelector gets the previously computed NodeSelector imposed by the PodOffloadingStrategy and

@@ -20,9 +20,11 @@ import (
 	"fmt"
 	"os"
 	"slices"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/cli-runtime/pkg/printers"
@@ -42,6 +44,7 @@ type Options struct {
 
 	Namespaces               []string
 	LabelSelector            string
+	OverrideExisting         bool
 	PodOffloadingStrategy    offloadingv1beta1.PodOffloadingStrategyType
 	NamespaceMappingStrategy offloadingv1beta1.NamespaceMappingStrategyType
 	RemoteNamespaceName      string
@@ -77,33 +80,18 @@ func (o *Options) Run(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, o.Timeout)
 	defer cancel()
 
-	var offloadNamespaces []string
-	offloadNamespaces = append(offloadNamespaces, o.Namespaces...)
+	offloadNamespaces, skippedNamespaces, err := o.selectNamespaces(ctx)
+	if err != nil {
+		return err
+	}
 
-	if o.LabelSelector != "" {
-		// Parse the label selector
-		selector, err := labels.Parse(o.LabelSelector)
-		if err != nil {
-			return fmt.Errorf("invalid label selector: %w", err)
-		}
-
-		// List namespaces
-		var selectedNsList corev1.NamespaceList
-		if err := o.CRClient.List(ctx, &selectedNsList, &client.ListOptions{LabelSelector: selector}); err != nil {
-			return fmt.Errorf("cannot list namespace objects: %w", err)
-		}
-
-		for i := range selectedNsList.Items {
-			ns := &selectedNsList.Items[i]
-			if !slices.Contains(offloadNamespaces, ns.Name) {
-				offloadNamespaces = append(offloadNamespaces, ns.Name)
-			}
-		}
+	if len(skippedNamespaces) > 0 {
+		o.Printer.Warning.Printfln("Skipping namespaces already offloaded (use --override-existing to update them): %s",
+			strings.Join(skippedNamespaces, ", "))
 	}
 
 	if len(offloadNamespaces) == 0 {
-		o.Printer.Info.Println("No namespaces can be offloaded")
-		return nil
+		return fmt.Errorf("no namespaces can be offloaded")
 	}
 
 	// Offload each namespace
@@ -119,6 +107,79 @@ func (o *Options) Run(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// selectNamespaces resolves the namespaces to offload: the explicitly named ones, plus the ones
+// matched by the label selector (supporting '=', '==' and '!=' only), when specified.
+//
+// The selector is evaluated once, when the command runs: namespaces labeled afterwards are not
+// automatically offloaded. Namespaces matched through the selector that are already offloaded
+// (i.e., a NamespaceOffloading resource already exists) are skipped and returned in the skipped
+// list, unless OverrideExisting is set; explicitly named namespaces are always processed, since
+// naming them is already an explicit authorization to update them.
+//
+// An error is returned when no namespace is selected at all (e.g., the selector matches nothing).
+func (o *Options) selectNamespaces(ctx context.Context) (selected, skipped []string, err error) {
+	selected = append(selected, o.Namespaces...)
+
+	if o.LabelSelector == "" {
+		if len(selected) == 0 {
+			return nil, nil, fmt.Errorf("no namespaces can be offloaded: no namespace name nor selector specified")
+		}
+		return selected, nil, nil
+	}
+
+	// Parse the label selector
+	selector, err := labels.Parse(o.LabelSelector)
+	if err != nil {
+		return nil, nil, fmt.Errorf("invalid label selector: %w", err)
+	}
+
+	// List namespaces
+	var selectedNsList corev1.NamespaceList
+	if err := o.CRClient.List(ctx, &selectedNsList, &client.ListOptions{LabelSelector: selector}); err != nil {
+		return nil, nil, fmt.Errorf("cannot list namespace objects: %w", err)
+	}
+
+	if len(selectedNsList.Items) == 0 && len(selected) == 0 {
+		return nil, nil, fmt.Errorf("no namespaces can be offloaded: the selector %q matched no namespaces", o.LabelSelector)
+	}
+
+	for i := range selectedNsList.Items {
+		ns := &selectedNsList.Items[i]
+		if slices.Contains(selected, ns.Name) || slices.Contains(skipped, ns.Name) {
+			continue
+		}
+
+		if !o.OverrideExisting {
+			alreadyOffloaded, err := o.isAlreadyOffloaded(ctx, ns.Name)
+			if err != nil {
+				return nil, nil, err
+			}
+			if alreadyOffloaded {
+				skipped = append(skipped, ns.Name)
+				continue
+			}
+		}
+
+		selected = append(selected, ns.Name)
+	}
+
+	return selected, skipped, nil
+}
+
+// isAlreadyOffloaded returns whether the given namespace already hosts a NamespaceOffloading resource.
+func (o *Options) isAlreadyOffloaded(ctx context.Context, namespace string) (bool, error) {
+	nsoff := &offloadingv1beta1.NamespaceOffloading{}
+	err := o.CRClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: consts.DefaultNamespaceOffloadingName}, nsoff)
+	switch {
+	case err == nil:
+		return true, nil
+	case apierrors.IsNotFound(err):
+		return false, nil
+	default:
+		return false, fmt.Errorf("cannot check the offloading status of namespace %q: %w", namespace, err)
+	}
 }
 
 // runOffload encapsulates the core logic of the offload namespace command.

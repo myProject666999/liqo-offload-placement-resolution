@@ -50,6 +50,13 @@ Besides the direct offloading of a namespace, this command also provides the
 possibility to generate and output the underlying NamespaceOffloading
 resource, that can later be applied through automation tools.
 
+The --ns-selector option selects the namespaces to offload through a label
+query (supporting '=', '==' and '!=' only). It is evaluated once, when the
+command runs: namespaces labeled afterwards are not automatically offloaded.
+The command fails when the selector matches no namespace. Namespaces that are
+already offloaded are skipped and listed, unless --override-existing is
+specified to update them; explicitly named namespaces are always updated.
+
 Examples:
   $ {{ .Executable }} offload namespace foo
 or
@@ -144,7 +151,10 @@ func newOffloadNamespaceCommand(ctx context.Context, f *factory.Factory) *cobra.
 	cmd.Flags().StringArrayVarP(&selectors, "selector", "l", []string{},
 		"The selector to filter the target clusters. Can be specified multiple times, defining alternative requirements (i.e., in logical OR)")
 	cmd.Flags().StringVar(&labelSelector, "ns-selector", "",
-		"Selector (label query) to filter namespaces, supports '=', '==', and '!=' (e.g., -l key1=value1,key2=value2).")
+		"Selector (label query) to filter namespaces, supports '=', '==', and '!=' (e.g., -l key1=value1,key2=value2). "+
+			"Evaluated once: namespaces labeled afterwards are not automatically offloaded")
+	cmd.Flags().BoolVar(&options.OverrideExisting, "override-existing", false,
+		"Update the namespaces selected through --ns-selector that are already offloaded, instead of skipping them")
 
 	cmd.Flags().VarP(outputFormat, "output", "o",
 		"Output the resulting NamespaceOffloading resource, instead of applying it. Supported formats: json, yaml")

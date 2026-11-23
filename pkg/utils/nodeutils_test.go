@@ -301,4 +301,74 @@ var _ = Describe("NodeUtils", func() {
 
 	})
 
+	Context("mergeNodeSelector with MatchFields", func() {
+
+		getField := func(n int) v1.NodeSelectorRequirement {
+			return v1.NodeSelectorRequirement{
+				Key:      "metadata.name",
+				Operator: v1.NodeSelectorOpIn,
+				Values:   []string{fmt.Sprintf("node%v", n)},
+			}
+		}
+
+		It("preserves the MatchFields of both selectors in the cartesian product", func() {
+			ns1 := &v1.NodeSelector{NodeSelectorTerms: []v1.NodeSelectorTerm{{
+				MatchExpressions: []v1.NodeSelectorRequirement{{
+					Key:      "label1",
+					Operator: v1.NodeSelectorOpIn,
+					Values:   []string{"val1"},
+				}},
+				MatchFields: []v1.NodeSelectorRequirement{getField(1)},
+			}}}
+			ns2 := &v1.NodeSelector{NodeSelectorTerms: []v1.NodeSelectorTerm{{
+				MatchExpressions: []v1.NodeSelectorRequirement{{
+					Key:      "label2",
+					Operator: v1.NodeSelectorOpIn,
+					Values:   []string{"val2"},
+				}},
+				MatchFields: []v1.NodeSelectorRequirement{getField(2)},
+			}}}
+
+			merged := MergeNodeSelector(ns1, ns2)
+			Expect(merged.NodeSelectorTerms).To(HaveLen(1))
+			Expect(merged.NodeSelectorTerms[0].MatchExpressions).To(HaveLen(2))
+			By("not dropping the MatchFields of the merged terms")
+			Expect(merged.NodeSelectorTerms[0].MatchFields).To(Equal([]v1.NodeSelectorRequirement{getField(1), getField(2)}))
+		})
+	})
+
+	Context("mergeNodeSelectorWithLimit", func() {
+
+		getSelector := func(n int) *v1.NodeSelector {
+			terms := make([]v1.NodeSelectorTerm, 0, n)
+			for i := range n {
+				terms = append(terms, v1.NodeSelectorTerm{
+					MatchExpressions: []v1.NodeSelectorRequirement{{
+						Key:      fmt.Sprintf("label%v", i),
+						Operator: v1.NodeSelectorOpIn,
+						Values:   []string{"val"},
+					}},
+				})
+			}
+			return &v1.NodeSelector{NodeSelectorTerms: terms}
+		}
+
+		It("merges the selectors when the product is within the limit", func() {
+			merged, err := MergeNodeSelectorWithLimit(getSelector(3), getSelector(4), 12)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(merged.NodeSelectorTerms).To(HaveLen(12))
+		})
+
+		It("rejects, rather than truncating, when the product exceeds the limit", func() {
+			_, err := MergeNodeSelectorWithLimit(getSelector(3), getSelector(4), 11)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("12"))
+		})
+
+		It("rejects a non-positive limit", func() {
+			_, err := MergeNodeSelectorWithLimit(getSelector(1), getSelector(1), 0)
+			Expect(err).To(HaveOccurred())
+		})
+	})
+
 })
